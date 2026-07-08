@@ -1,0 +1,31 @@
+{
+  "misuse_pattern_name": "ThreadLocalStateLifecycleMismanagement",
+  "target_frameworks_or_classes": [
+    "java.lang.ThreadLocal",
+    "java.util.concurrent.ThreadPoolExecutor",
+    "com.esotericsoftware.kryo.kryo5.Kryo",
+    "io.grpc.Context",
+    "org.apache.shiro.subject.support.ThreadContext",
+    "org.mybatis.logging.ErrorContext",
+    "jakarta.ws.rs.container.AsyncResponse"
+  ],
+  "vulnerable_methods": [
+    "ThreadLocal.set",
+    "ThreadLocal.get",
+    "ThreadLocal.withInitial",
+    "ThreadLocal.remove",
+    "java.util.concurrent.ExecutorService.submit",
+    "java.util.concurrent.ExecutorService.execute",
+    "java.util.concurrent.CompletableFuture.supplyAsync",
+    "java.util.concurrent.CompletableFuture.runAsync"
+  ],
+  "sink_functions": [
+    "ThreadLocal.get",
+    "SecurityUtils.getSubject",
+    "DatabaseContext.INSTANCE.getContext",
+    "ErrorContext.instance",
+    "XSwapUtil.getKryo",
+    "ServerContext.current"
+  ],
+  "detection_strategy": "Perform inter-procedural data-flow analysis. 1) Identify all `ThreadLocal.set()` calls. 2) Trace forward to find if the enclosing method or any caller has a `try-finally` block that guarantees a `ThreadLocal.remove()` call. 3) Flag any `set()` without a corresponding `remove()` in a `finally` block as a potential leak. 4) Additionally, detect `ThreadLocal` declared as a non-static field of a class, and check if the value stored in it holds a strong reference back to the enclosing class instance. If so, flag as a potential memory leak due to reference cycle. 5) For `ExecutorService` submissions, check if the submitted `Runnable`/`Callable` uses `ThreadLocal` and fails to call `remove()` at the end of its `run()`/`call()` method."
+}
