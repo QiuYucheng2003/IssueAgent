@@ -13,3 +13,9 @@ ThreadLocal not removed thread pool
 ThreadLocal memory leak thread pool
 ThreadLocal not cleaned up thread pool
 ThreadLocal stale data thread pool
+ThreadLocal memory leak thread pool
+ThreadLocal not cleaned up ExecutorService
+ThreadLocal reuse across tasks
+ThreadLocal memory leak
+ThreadLocal with ThreadPool
+ThreadLocal clearing after task

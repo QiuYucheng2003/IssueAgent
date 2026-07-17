@@ -122,7 +122,7 @@ class RuleBook:
             keywords = THREADLOCAL_POLICY["issue_keywords"] + keywords
         return unique([keyword for keyword in keywords if keyword])
 
-    def fallback_queries(self, language: str, limit: int) -> list[str]:
+    def fallback_queries(self, language: str, limit: int, min_stars: int = 100, min_forks: int = 10) -> list[str]:
         queries = [f'"{short_name(target)}" language:{language}' for target in self.targets if len(short_name(target)) > 2]
         for method in self.methods:
             name = method_name(method)
@@ -251,7 +251,7 @@ def clients(config: Config) -> tuple[OpenAI, Github]:
 # ==================== 3. 搜索与候选生成 ====================
 
 def generate_queries(llm: OpenAI, rules: RuleBook, profile: str, config: Config) -> list[str]:
-    fallback = rules.fallback_queries(config.language, config.max_queries)
+    fallback = rules.fallback_queries(config.language, config.max_queries, config.min_stars, config.min_forks)
     prompt = f"""你是程序分析与软件测试方向的 GitHub Code Search 专家。
 
 节点 B 已总结出以下缺陷规则：
@@ -263,9 +263,10 @@ def generate_queries(llm: OpenAI, rules: RuleBook, profile: str, config: Config)
 请生成 {config.max_queries} 条 GitHub Code Search 查询语句，用于寻找尚未被申报 issue 的真实代码误用候选。
 要求：
 1. 每条 query 必须能直接传给 GitHub Code Search。
-2. 优先面向 GitHub 上 star 数较多、热门、有名气的项目，query 本身要组合关键 API、危险上下文、语言限定，例如 language:{config.language}。
-3. 不要搜索 issue，只搜索代码。
-4. 直接输出 JSON 数组字符串，不要 Markdown。
+2. 每条 query 必须包含 language:{config.language} 限定符。
+3. 不要使用 stars: 或 forks: 限定符，这些在 Code Search 中不支持。
+4. 不要搜索 issue，只搜索代码。
+5. 直接输出 JSON 数组字符串，不要 Markdown。
 """
     try:
         response = llm.chat.completions.create(
@@ -293,17 +294,30 @@ def search_candidates(github: Github, queries: list[str], rules: RuleBook, confi
         print(f"🔍 Code Search: {query}")
         try:
             kept = 0
+            result_count = 0
             for result in github.search_code(query=query):
+                result_count += 1
                 if kept >= config.max_per_query:
                     break
                 repo = result.repository
                 if repo.stargazers_count < config.min_stars or repo.forks_count < config.min_forks:
+                    print(f"  [{result_count}] 跳过: {repo.full_name} (stars={repo.stargazers_count}, forks={repo.forks_count})")
                     continue
                 if result.html_url in visited:
+                    print(f"  [{result_count}] 跳过: {repo.full_name} (已访问)")
+                    continue
+
+                path_lower = result.path.lower()
+                excluded_patterns = ["test/", "/test/", "tests/", "/tests/", "_test.java", ".test.java",
+                                     "example/", "/example/", "tutorial/", "/tutorial/",
+                                     "learning/", "/learning/", "demo/", "/demo/", "samples/"]
+                if any(pattern in path_lower for pattern in excluded_patterns):
+                    print(f"  [{result_count}] 跳过: {repo.full_name} (路径包含测试/教程文件)")
                     continue
 
                 snippet = fetch_snippet(result, rules, config.context_lines)
                 if not passes_static_filter(snippet, rules):
+                    print(f"  [{result_count}] 跳过: {repo.full_name} (静态过滤不通过)")
                     continue
 
                 candidate = CodeCandidate(
@@ -315,12 +329,13 @@ def search_candidates(github: Github, queries: list[str], rules: RuleBook, confi
                     file_url=result.html_url,
                     query=query,
                     code_snippet=snippet,
-                    known_issue_hits=search_related_issues(github, repo.full_name, rules),
+                    known_issue_hits=[],
                 )
                 candidates.append(candidate)
                 append_jsonl(PATHS["candidates"], asdict(candidate))
                 visited.add(result.html_url)
                 kept += 1
+                print(f"  [{result_count}] 保留: {repo.full_name}/{result.path} (stars={repo.stargazers_count})")
                 sleep(config)
         except GithubException as exc:
             print(f"⚠️ GitHub 搜索失败: {query} | {exc.status} {exc.data}")
@@ -374,6 +389,8 @@ def passes_static_filter(snippet: str, rules: RuleBook) -> bool:
         return False
     if not rules.is_threadlocal:
         return True
+
+    # 基本检查：必须包含 ThreadLocal 和 .set( 或 .withInitial(
     return (
         all(term in snippet for term in THREADLOCAL_POLICY["required_all"])
         and any(term in snippet for term in THREADLOCAL_POLICY["required_any"])
@@ -396,8 +413,10 @@ def search_related_issues(github: Github, repo: str, rules: RuleBook, limit: int
 
 # ==================== 4. LLM 判定与报告 ====================
 
-def judge_candidate(llm: OpenAI, candidate: CodeCandidate, rules: RuleBook, profile: str, config: Config) -> Finding | None:
-    known_issue_text = json.dumps(candidate.known_issue_hits, ensure_ascii=False, indent=2) if candidate.known_issue_hits else "未发现相关 issue 命中。"
+def judge_candidate(github: Github, llm: OpenAI, candidate: CodeCandidate, rules: RuleBook, profile: str, config: Config) -> Finding | None:
+    print(f"🔍 搜索相关 issues: {candidate.repository}")
+    known_issue_hits = search_related_issues(github, candidate.repository, rules)
+    known_issue_text = json.dumps(known_issue_hits, ensure_ascii=False, indent=2) if known_issue_hits else "未发现相关 issue 命中。"
     prompt = f"""你是程序分析与软件测试研究员，正在判断一个 GitHub 代码候选是否值得作为“尚未申报 issue 的误用/缺陷”提交给开源项目。
 
 节点 B 的结构化缺陷规则：
@@ -417,8 +436,11 @@ GitHub issue 检索结果: {known_issue_text}
 {candidate.code_snippet[:config.llm_snippet_chars]}
 ```
 
-请严格基于代码片段和规则判断，不要编造跨文件事实。
-你的任务是为后续 Node_D 验证阶段筛选候选。若已有相关 issue 命中，除非代码证据显示这是完全不同的新缺陷，否则应判定为不适合申报。
+判断规则：
+1. 如果代码中已有 `.remove()` 调用或使用 `try-finally` 正确清理 ThreadLocal，则直接判定为 is_reportable=false
+2. 如果代码不在线程池环境（没有 ExecutorService/ThreadPool/Runnable/Callable），则不是 ThreadLocal 误用场景
+3. 请严格基于代码片段和规则判断，不要编造跨文件事实
+4. 你的任务是为后续 Node_D 验证阶段筛选候选。若已有相关 issue 命中，除非代码证据显示这是完全不同的新缺陷，否则应判定为不适合申报。
 
 只输出一个可被 json.loads 解析的 JSON 对象，字段如下：
 {{
@@ -543,7 +565,7 @@ def run(args: argparse.Namespace) -> None:
 
     findings = []
     for candidate in candidates[: config.max_candidates_to_judge]:
-        finding = judge_candidate(llm, candidate, rules, profile, config)
+        finding = judge_candidate(github, llm, candidate, rules, profile, config)
         if finding:
             findings.append(finding)
         sleep(config)

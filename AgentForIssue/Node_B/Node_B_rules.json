@@ -1,31 +1,41 @@
 {
-  "misuse_pattern_name": "ThreadLocalStateLifecycleMismanagement",
+  "misuse_pattern_name": "ThreadLocal_Lifecycle_Mismanagement_Context_Pollution_and_Resource_Leak",
   "target_frameworks_or_classes": [
     "java.lang.ThreadLocal",
+    "java.lang.InheritableThreadLocal",
+    "java.util.concurrent.ExecutorService",
     "java.util.concurrent.ThreadPoolExecutor",
-    "com.esotericsoftware.kryo.kryo5.Kryo",
+    "javax.servlet.Filter",
+    "org.springframework.web.filter.OncePerRequestFilter",
     "io.grpc.Context",
+    "reactor.core.publisher.Mono",
+    "reactor.core.publisher.Flux",
     "org.apache.shiro.subject.support.ThreadContext",
-    "org.mybatis.logging.ErrorContext",
-    "jakarta.ws.rs.container.AsyncResponse"
+    "com.esotericsoftware.kryo.kryo5.Kryo",
+    "org.eclipse.jetty.util.Pool",
+    "org.apache.poi.hssf.record.crypto.Biff8EncryptionKey"
   ],
   "vulnerable_methods": [
-    "ThreadLocal.set",
-    "ThreadLocal.get",
-    "ThreadLocal.withInitial",
-    "ThreadLocal.remove",
-    "java.util.concurrent.ExecutorService.submit",
-    "java.util.concurrent.ExecutorService.execute",
-    "java.util.concurrent.CompletableFuture.supplyAsync",
-    "java.util.concurrent.CompletableFuture.runAsync"
+    "java.lang.ThreadLocal.set()",
+    "java.lang.ThreadLocal.withInitial()",
+    "java.lang.InheritableThreadLocal.set()",
+    "org.apache.shiro.subject.support.ThreadContext.bind()",
+    "com.esotericsoftware.kryo.kryo5.Kryo.readClassAndObject()",
+    "com.esotericsoftware.kryo.kryo5.Kryo.writeClassAndObject()",
+    "org.apache.poi.hssf.record.crypto.Biff8EncryptionKey.setCurrentUserPassword()",
+    "io.grpc.Context.attach()",
+    "reactor.core.publisher.Mono.subscribeOn()",
+    "java.util.concurrent.ExecutorService.submit()"
   ],
   "sink_functions": [
-    "ThreadLocal.get",
-    "SecurityUtils.getSubject",
-    "DatabaseContext.INSTANCE.getContext",
-    "ErrorContext.instance",
-    "XSwapUtil.getKryo",
-    "ServerContext.current"
+    "java.lang.ThreadLocal.get()",
+    "org.apache.shiro.subject.support.ThreadContext.getSubject()",
+    "org.apache.shiro.SecurityUtils.getSubject()",
+    "com.esotericsoftware.kryo.kryo5.Kryo.readClassAndObject()",
+    "org.apache.poi.hssf.record.crypto.Biff8EncryptionKey.getCurrentUserPassword()",
+    "io.grpc.Context.current()",
+    "reactor.core.publisher.Mono.deferContextual()",
+    "java.lang.ClassLoader.loadClass()"
   ],
-  "detection_strategy": "Perform inter-procedural data-flow analysis. 1) Identify all `ThreadLocal.set()` calls. 2) Trace forward to find if the enclosing method or any caller has a `try-finally` block that guarantees a `ThreadLocal.remove()` call. 3) Flag any `set()` without a corresponding `remove()` in a `finally` block as a potential leak. 4) Additionally, detect `ThreadLocal` declared as a non-static field of a class, and check if the value stored in it holds a strong reference back to the enclosing class instance. If so, flag as a potential memory leak due to reference cycle. 5) For `ExecutorService` submissions, check if the submitted `Runnable`/`Callable` uses `ThreadLocal` and fails to call `remove()` at the end of its `run()`/`call()` method."
+  "detection_strategy": "1. **数据流分析 (Data Flow Analysis)**: 对每个`ThreadLocal.set()`调用，进行过程间数据流分析，追踪其所有后续执行路径（包括异常路径`ExceptionPath`）。如果存在任何一条路径未调用对应的`ThreadLocal.remove()`，则报告一个缺陷。\n2. **生命周期配对检查 (Lifecycle Pairing Check)**: 识别`static final ThreadLocal`字段。检查其`set()`和`remove()`是否在同一个方法或同一个`try-finally`块中被配对调用。\n3. **反向引用环检测 (Back-Reference Cycle Detection)**: 对于`ThreadLocal`的值类型，分析其字段是否持有对声明该`ThreadLocal`的类的强引用。如果是，则报告潜在的内存泄漏风险。\n4. **Lambda/匿名类类加载器分析 (Lambda/Anonymous Class ClassLoader Analysis)**: 对于`ThreadLocal.withInitial(Supplier)`，检查`Supplier`是否为Lambda或匿名内部类。如果是，且该`ThreadLocal`是`static final`的，则报告潜在的类加载器泄漏风险。\n5. **跨线程上下文传播检查 (Cross-Thread Context Propagation Check)**: 检测`InheritableThreadLocal`在`ExecutorService`、`Schedulers.boundedElastic()`或Virtual Threads环境中的使用。如果上下文在子线程中丢失或错误传播，则报告缺陷。\n6. **敏感数据存储检查 (Sensitive Data Storage Check)**: 识别在`ThreadLocal`中存储密码、密钥、令牌等敏感信息的模式。如果`remove()`不是强制性的（例如，没有`try-finally`），则报告安全风险。"
 }
