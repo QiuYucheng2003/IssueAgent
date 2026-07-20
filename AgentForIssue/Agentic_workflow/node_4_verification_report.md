@@ -1,0 +1,301 @@
+# Node 4 验证报告
+
+生成时间: 2026-07-19 16:44:44
+
+## 验证结果统计
+
+- 验证候选总数: 22
+- 确认误用: 17
+- 排除误报: 5
+
+## 确认的误用案例
+
+### 1. Feng14/MiniWeChat-Server
+
+- **文件**: [src/model/HibernateSessionFactory.java](https://github.com/Feng14/MiniWeChat-Server/blob/0d7332439c7c5e79ac1d300996d6087843374c11/src/model/HibernateSessionFactory.java)
+- **Stars**: 213
+- **Forks**: 120
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 95.0%
+- **根因分析**: 代码在 getSession() 方法中调用 ThreadLocal.set(session) 将 Hibernate Session 绑定到当前线程，但在 commitSession() 中仅关闭 Session，从未调用 ThreadLocal.remove() 清除引用。在 Web 线程池环境下，线程会被复用，关闭后的 Session 对象仍被 ThreadLocal 强引用，导致 Session 无法被 GC 回收，从而造成内存泄漏；同时后续请求可能从 ThreadLocal 获取到已关闭的 Session，虽然代码判断了 isOpen() 会重新打开，但残留引用本身仍然构成资源泄露。
+
+**证据**:
+- 第 12 行: private static final ThreadLocal<Session> threadLocal = new ThreadLocal<Session>();
+- 第 37 行: threadLocal.set(session);
+- 第 50 行: session.close();  // 仅关闭，未调用 threadLocal.remove()
+
+**修复建议**: 在每次使用完 Session 后（如在 commitSession 末尾或独立的清理方法中）调用 threadLocal.remove() 清除线程局部变量，推荐在 finally 块中调用以确保异常路径也能执行清理。例如：public static void closeAndRemoveSession() { Session s = threadLocal.get(); if (s != null) { s.close(); threadLocal.remove(); } }。也可结合 Filter 或 Interceptor 在请求结束时统一清理。
+
+### 2. ZHENFENG13/concurrent-programming
+
+- **文件**: [src/chapter4/ThreadLocalDemo_GC.java](https://github.com/ZHENFENG13/concurrent-programming/blob/0744c27d5a30f7638b820ac570a2fea31ddfb934/src/chapter4/ThreadLocalDemo_GC.java)
+- **Stars**: 632
+- **Forks**: 247
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 92.0%
+- **根因分析**: 在线程池（ExecutorService）环境下，ParseDate.run()方法中通过 threadLocal.set() 设置了 SimpleDateFormat 实例，但 finally 块（第45-47行）仅调用了 CountDownLatch.countDown()，未调用 ThreadLocal.remove() 进行清理。线程池中的线程会被重复利用，导致每个线程的 ThreadLocalMap 中持续持有 SimpleDateFormat 对象，即使外部将 ThreadLocal 引用置为 null 并触发 GC，线程内残余的 value 仍无法被回收，形成内存泄漏。
+
+**证据**:
+- 第34行: threadLocal.set(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss") { ... });
+- 第45-47行: } finally { countDownLatch.countDown(); }
+
+**修复建议**: 在 finally 块中添加 threadLocal.remove() 调用，确保任务执行完毕后清理当前线程持有的 ThreadLocal 数据，避免在线程池复用场景下造成内存泄漏。如果业务需要在线程生命周期内复用 SimpleDateFormat，则应评估线程池与 ThreadLocal 的生命周期绑定，或采用其他显式清理策略（例如在 ThreadLocal.withInitial 中创建实例，并在不再需要时统一调用 remove）。
+
+### 3. xnio/xnio
+
+- **文件**: [api/src/main/java/org/xnio/Xnio.java](https://github.com/xnio/xnio/blob/27bec13a1ed74b2dc1b5de91e71fe1fc17f6d8fd/api/src/main/java/org/xnio/Xnio.java)
+- **Stars**: 293
+- **Forks**: 154
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 90.0%
+- **根因分析**: 在 allowBlocking 方法中，线程本地变量 BLOCKING 被重新设置，但未调用 remove()。线程池复用场景下，若某个任务改变了 blocking 标志（如设为 false）而未显式恢复，后续被复用线程的 isBlockingAllowed() 将返回错误值，造成数据污染。该方法虽返回旧值以便调用者恢复，但缺乏强制清理机制，属于典型的数据泄漏风险。
+
+**证据**:
+- 第 121 行: private static final ThreadLocal<Boolean> BLOCKING = new ThreadLocal<Boolean>() { protected Boolean initialValue() { return Boolean.TRUE; } };
+- 第 144 行: threadLocal.set(Boolean.valueOf(newSetting));
+
+**修复建议**: 建议在线程任务结束边界（如 try-finally）中调用 BLOCKING.remove() 或使用原有值进行恢复；或提供类似 executeWithBlocking(boolean, Runnable) 的工具方法，在 finally 中自动重置为默认值，避免状态泄露。
+
+### 4. SpringCloud/spring-cloud-code
+
+- **文件**: [ch6-4/ch6-4-hystrix-thread-context/src/main/java/cn/springcloud/book/hystrix/controller/ThreadContextController.java](https://github.com/SpringCloud/spring-cloud-code/blob/bca58f0b8069d9afa71bc18621cf825cb941d67f/ch6-4/ch6-4-hystrix-thread-context/src/main/java/cn/springcloud/book/hystrix/controller/ThreadContextController.java)
+- **Stars**: 1892
+- **Forks**: 983
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 95.0%
+- **根因分析**: 在 getUser 方法中直接调用了 HystrixThreadLocal.threadLocal.set("userId : "+ id) 设置线程局部变量，但方法结束时未在 finally 块中调用 remove() 进行清理。该控制器运行在 Tomcat 线程池环境中，线程会被复用，导致前一个请求的 userId 残留在 ThreadLocal 中，后续请求可能读取到错误的数据，同时造成内存泄漏。
+
+**证据**:
+- 第28行: HystrixThreadLocal.threadLocal.set("userId : "+ id);
+- 方法结束前未发现 HystrixThreadLocal.threadLocal.remove() 调用
+
+**修复建议**: 在方法体中使用 try-finally 结构，在 finally 块中调用 HystrixThreadLocal.threadLocal.remove() 清除数据；或者引入 Spring 拦截器/过滤器统一在请求结束后清理自定义 ThreadLocal。
+
+### 5. zanata/zanata-platform
+
+- **文件**: [server/services/src/main/java/org/zanata/async/AsyncMethodInterceptor.java](https://github.com/zanata/zanata-platform/blob/68c80db891bc816f737fbfd1c77b6f68fb295143/server/services/src/main/java/org/zanata/async/AsyncMethodInterceptor.java)
+- **Stars**: 340
+- **Forks**: 52
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 95.0%
+- **根因分析**: 在异步任务 lambda 中通过 shouldRunAsyncThreadLocal.set(false) 设置了线程局部变量，但在异步任务的 finally 块中缺少对应的 remove() 调用。线程池中的工作线程在执行完该异步任务后，ThreadLocal 仍保留值为 false，导致该线程被复用时 shouldRunAsyncThreadLocal.get() 返回 false，使得后续本应异步执行的方法被错误地同步执行，同时造成 ThreadLocal 的内存泄漏。
+
+**证据**:
+- 第 84 行: shouldRunAsyncThreadLocal.set(false);
+- 第 99-104 行: finally 块中仅处理了 handle 的收尾工作，缺少 shouldRunAsyncThreadLocal.remove();
+
+**修复建议**: 在异步任务的 finally 块中显式调用 shouldRunAsyncThreadLocal.remove()，确保异步任务执行完毕后线程局部变量被清理，避免线程池线程复用时的状态污染和内存泄漏。
+
+### 6. apache/tomcat
+
+- **文件**: [java/org/apache/catalina/filters/RequestDumperFilter.java](https://github.com/apache/tomcat/blob/ebdbc5854e7acd9f72241834a5fc69fa3d750518/java/org/apache/catalina/filters/RequestDumperFilter.java)
+- **Stars**: 8206
+- **Forks**: 5381
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 95.0%
+- **根因分析**: RequestDumperFilter 在类中定义了 static final ThreadLocal<Timestamp>，使用 withInitial(Timestamp::new) 为每个线程提供初始 Timestamp 对象。在 doFilter 方法中，通过 getTimestamp()（内部调用 timestamp.get()）获取时间戳并记录日志，但在整个请求处理过程中（包括异常路径）均未调用 timestamp.remove() 进行清理。由于 Tomcat 采用线程池，线程会被复用，导致上一个请求的 Timestamp 对象残留在线程的 ThreadLocalMap 中，下一个请求可能继续使用旧的时间戳数据，造成时间戳信息不准确以及内存泄漏。
+
+**证据**:
+- 第66行: private static final ThreadLocal<Timestamp> timestamp = ThreadLocal.withInitial(Timestamp::new);
+- 第99行: doLog("START TIME        ", getTimestamp());
+- doFilter 方法及整个类代码中未出现 timestamp.remove() 调用，也未包含 try-finally 清理保护
+
+**修复建议**: 在 doFilter 方法末尾的 finally 块中添加 timestamp.remove()，确保每次请求结束后清除当前线程的 Timestamp 实例，避免线程池复用时的数据污染和内存泄漏。如果仅需在单次请求内使用时间戳，建议改为方法局部变量，彻底避免 ThreadLocal 滥用。
+
+### 7. Alluxio/alluxio
+
+- **文件**: [core/server/proxy/src/main/java/alluxio/proxy/s3/S3Handler.java](https://github.com/Alluxio/alluxio/blob/3f21b2d3aceb778fd92fc511a853355cee2f3734/core/server/proxy/src/main/java/alluxio/proxy/s3/S3Handler.java)
+- **Stars**: 7212
+- **Forks**: 2939
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 90.0%
+- **根因分析**: 代码中声明了 static final ThreadLocal<byte[]> TLS_BYTES，并通过 withInitial 为每个线程初始化 8KB 字节数组。该 ThreadLocal 在 Servlet 线程池环境中被使用，线程长时间存活且会被多个请求复用。然而整个代码片段（包括后续逻辑）未出现任何对 TLS_BYTES 的 remove() 调用，也未见到在请求处理完成后的 finally 块中清理该 ThreadLocal。这意味着每个线程第一次访问 TLS_BYTES 后，该 8KB 缓冲区将一直保留在线程的 ThreadLocalMap 中，即使后续不再需要，也无法被垃圾回收。在线程池内大量线程复用的情况下，会导致内存持续占用，形成典型的内存泄漏风险。
+
+**证据**:
+- 第 91 行: private static final ThreadLocal<byte[]> TLS_BYTES = ThreadLocal.withInitial(() -> new byte[8 * 1024]);
+
+**修复建议**: 在使用 TLS_BYTES 的关键方法（如请求处理入口）中，采用 try-finally 模式，确保每次使用后调用 TLS_BYTES.remove() 进行清理。例如：byte[] buffer = TLS_BYTES.get(); try { ... } finally { TLS_BYTES.remove(); }。如果该字节数组在整个请求生命周期中需要复用，也可以在请求处理完成后统一调用 remove，避免内存残留。
+
+### 8. AsyncHttpClient/async-http-client
+
+- **文件**: [client/src/main/java/org/asynchttpclient/util/StringBuilderPool.java](https://github.com/AsyncHttpClient/async-http-client/blob/3b891bb4157df87997728144338be3faa5650ec3/client/src/main/java/org/asynchttpclient/util/StringBuilderPool.java)
+- **Stars**: 6393
+- **Forks**: 1596
+- **误用类型**: DATA_POLLUTION
+- **置信度**: 90.0%
+- **根因分析**: ThreadLocal<StringBuilder> 存储了非线程安全的可变对象 StringBuilder。虽然在每次获取时通过 setLength(0) 重置了内容，但在同一线程内发生重入调用时（例如外层调用 stringBuilder() 开始构造字符串，内层方法再次调用 stringBuilder()），内层调用会清空同一个 StringBuilder，导致外层已构建的数据被意外破坏，出现数据污染。这属于 ThreadLocal 共享可变状态导致的重入安全问题。注释“BEWARE: MUSTN'T APPEND TO ITSELF!”只提及了不要追加到自身，但未识别或防止重入问题。
+
+**证据**:
+- 第 22 行: private final ThreadLocal<StringBuilder> pool = ThreadLocal.withInitial(() -> new StringBuilder(512));
+- 第 30-32 行: StringBuilder sb = pool.get(); sb.setLength(0); return sb;
+- 第 25 行: 注释 'BEWARE: MUSTN'T APPEND TO ITSELF!' 仅约束了自身追加，未覆盖重入场景。
+
+**修复建议**: 避免在同一线程中通过重入共享同一个 StringBuilder。可行的修复方案：(1) 改为每次创建新的 StringBuilder（牺牲性能但安全）；(2) 实现带栈深度的池管理，例如用 ThreadLocal<Deque<StringBuilder>> 并确保 push/pop 匹配；(3) 要求调用者在获取后迅速使用并“归还”，但无法从根本上防止重入污染，推荐方案 (1) 或方案 (2)。
+
+### 9. fabienrenaud/java-json-benchmark
+
+- **文件**: [src/main/java/com/github/fabienrenaud/jjb/JsonUtils.java](https://github.com/fabienrenaud/java-json-benchmark/blob/9e086553126159a8c97918df8431b21941e44973/src/main/java/com/github/fabienrenaud/jjb/JsonUtils.java)
+- **Stars**: 1038
+- **Forks**: 140
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 90.0%
+- **根因分析**: ThreadLocal 变量 THREAD_STRING_BUILDER 和 THREAD_BYTE_ARRAY_OUTPUT_STREAM 使用 withInitial 初始化，在线程第一次调用 get() 时设置值，并将对象保留在线程的整个生命周期中。代码中不存在任何 remove() 调用，当该类被用于线程池环境（如 Tomcat 工作线程、ExecutorService）时，线程会被复用，但 ThreadLocal 值永远不会被清理，导致每个线程持续持有 StringBuilder 和 ByteArrayOutputStream 对象，造成内存泄漏。同时，stringBuilder() 返回同一个 ThreadLocal 实例后仅重置长度，若同一线程中出现嵌套调用或并发重用，可能引发数据污染，但核心缺陷是缺失清理机制。
+
+**证据**:
+- 第 26 行: public static StringBuilder stringBuilder() { ... }
+- 第 27 行: StringBuilder b = THREAD_STRING_BUILDER.get();
+- 第 34 行: private static final ThreadLocal<StringBuilder> THREAD_STRING_BUILDER = ThreadLocal.withInitial(StringBuilder::new);
+
+**修复建议**: 在使用 ThreadLocal 提供可复用的非线程安全对象时，必须确保在请求或任务结束后调用 remove() 清理资源，避免在线程池中累积内存。建议采用 try-finally 模式，或使用封装类在 finally 块中执行 remove()。若仅用于临时缓冲，可考虑每次创建新实例并丢弃，避免 ThreadLocal 泄漏风险。
+
+### 10. StarRocks/starrocks
+
+- **文件**: [fe/fe-core/src/main/java/org/apache/iceberg/MetadataParser.java](https://github.com/StarRocks/starrocks/blob/9fa42200b6a8abe6b93b7cbf9f38fa75334e6c0b/fe/fe-core/src/main/java/org/apache/iceberg/MetadataParser.java)
+- **Stars**: 11907
+- **Forks**: 2482
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 90.0%
+- **根因分析**: 在线程池环境（ExecutorService.submit）中，通过 ThreadLocal 持有 Kryo 实例，但在提交的任务（parse 方法）执行完毕后，未在 finally 块中调用 ThreadLocal.remove() 进行清理。由于线程池会复用线程，线程的 ThreadLocalMap 会持续持有 Kryo 强引用，导致 Kryo 对象无法被 GC，造成内存泄漏；同时 Kryo 内部状态未被重置，可能污染后续任务，属于典型的 ThreadLocal 资源泄漏与可写状态误用。
+
+**证据**:
+- 第 71-77 行: 定义 ThreadLocal<Kryo> kryoThreadLocal，使用 withInitial 创建 Kryo 实例，但未在类中任何地方显式调用 remove()
+- 第 109-112 行: executorService.submit 提交异步任务，任务中调用 parse(resultBatch)，该调用链可能使用 kryoThreadLocal.get() 获取 Kryo 实例
+- 第 158-161 行: parse 方法内部调用 buildIcebergDataFile 等操作，未发现任何对 kryoThreadLocal.remove() 的调用，且在 parse 方法所在线程任务结束后缺乏清理逻辑
+
+**修复建议**: 在异步任务执行解析逻辑的 finally 块中，调用 kryoThreadLocal.remove() 以清除当前线程的 ThreadLocal 值。如果 Kryo 实例需要复用，至少应在每次使用后调用 Kryo.reset() 重置内部缓冲区，避免状态泄漏。推荐做法：在 parse 方法的 finally 块或 submit 任务的 lambda 的 finally 块中添加 kryoThreadLocal.remove()。
+
+### 11. SpringCloud/spring-cloud-code
+
+- **文件**: [ch6-4/ch6-4-hystrix-thread-context/src/main/java/cn/springcloud/book/hystrix/controller/ThreadContextController.java](https://github.com/SpringCloud/spring-cloud-code/blob/bca58f0b8069d9afa71bc18621cf825cb941d67f/ch6-4/ch6-4-hystrix-thread-context/src/main/java/cn/springcloud/book/hystrix/controller/ThreadContextController.java)
+- **Stars**: 1892
+- **Forks**: 983
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 100.0%
+- **根因分析**: 在Spring MVC控制器方法中，向自定义的ThreadLocal（HystrixThreadLocal.threadLocal）设置了用户ID，但方法结束后未在任何finally块中调用remove()进行清理。由于Spring Boot Web容器使用线程池处理请求，工作线程会被复用，残留的ThreadLocal值将泄漏到后续请求中，导致不同用户看到错误的数据，甚至引发用户身份混淆。
+
+**证据**:
+- 第28行: HystrixThreadLocal.threadLocal.set("userId : "+ id);
+- 第26-37行: 整个getUser方法缺少finally块或任何ThreadLocal.remove()调用
+
+**修复建议**: 在请求处理方法的最外层使用try-finally结构，确保在finally块中调用HystrixThreadLocal.threadLocal.remove()；或者利用Spring的Filter/HandlerInterceptor在请求结束后统一清理所有ThreadLocal变量。另外，该代码本意可能是配合Hystrix命令实现上下文传播，建议改用HystrixRequestContext和HystrixConcurrencyStrategy进行安全的线程上下文传递，避免手动管理ThreadLocal。
+
+### 12. xtuhcy/gecco
+
+- **文件**: [src/main/java/com/geccocrawler/gecco/spider/Spider.java](https://github.com/xtuhcy/gecco/blob/e1f32e1c437b783ac019754d1b3c4401b67572ba/src/main/java/com/geccocrawler/gecco/spider/Spider.java)
+- **Stars**: 2512
+- **Forks**: 871
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 95.0%
+- **根因分析**: SpiderBean 所在的爬虫线程运行在 GeccoEngine 的线程池中（Spider 实现 Runnable，会被提交到线程池）。run() 方法开始处调用了 SpiderThreadLocal.set(this) 将当前 Spider 实例绑定到线程，但在整个 run() 执行完毕（包括正常停止和异常退出）后，没有对应的 finally 清理块调用 ThreadLocal.remove()。线程复用后旧引用无法被 GC 回收，造成 ThreadLocal 内存泄漏。
+
+**证据**:
+- 第 57 行: SpiderThreadLocal.set(this);
+- 第 55-153 行: run() 方法内使用 while(true) 循环处理请求，仅在 stop 为 true 时 break 退出循环并结束 run 方法，全程未发现 SpiderThreadLocal.remove() 调用
+
+**修复建议**: 在 run() 方法内使用 try-finally 包裹核心循环，确保无论是正常停止、异常退出还是线程中断，都执行 SpiderThreadLocal.remove()。例如：在 run() 开头 try { ... while(...){...} } finally { SpiderThreadLocal.remove(); }。如果要在循环内部多次使用 ThreadLocal，可保持 set 在循环外，但 finally 清理不可省略。
+
+### 13. fayechenlong/plumelog
+
+- **文件**: [plumelog-trace/src/main/java/com/plumelog/trace/aspect/AbstractAspect.java](https://github.com/fayechenlong/plumelog/blob/ba4a6f7ac619e494bc41ee80412b9c32ad606bd6/plumelog-trace/src/main/java/com/plumelog/trace/aspect/AbstractAspect.java)
+- **Stars**: 391
+- **Forks**: 111
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 95.0%
+- **根因分析**: 在 aroundExecute 方法中，第 25 行获取了 LogMessageThreadLocal 存储的 TraceMessage 对象，第 34 行重新设置了该对象，但整个方法缺少 finally 块来调用 ThreadLocal.remove() 进行清理。由于该方法运行在 Servlet 容器或 Spring 线程池的线程中，线程会被复用，导致上一次请求的 TraceMessage 残留在下一请求中，造成数据泄漏。
+
+**证据**:
+- 第 25 行: TraceMessage traceMessage = LogMessageThreadLocal.logMessageThreadLocal.get();
+- 第 34 行: LogMessageThreadLocal.logMessageThreadLocal.set(traceMessage);
+- 第 46 行: 方法结束，未出现任何 LogMessageThreadLocal.logMessageThreadLocal.remove() 调用
+
+**修复建议**: 在方法末尾增加 finally 代码块，调用 LogMessageThreadLocal.logMessageThreadLocal.remove() 确保线程归还线程池前清理上下文，避免数据污染后续任务。
+
+### 14. jeecgboot/MiniDao
+
+- **文件**: [minidao-pe/src/main/java/org/jeecgframework/minidao/pagehelper/dialect/PageAutoDialect.java](https://github.com/jeecgboot/MiniDao/blob/3a95f44b269026287f44bbef45633a2c47808481/minidao-pe/src/main/java/org/jeecgframework/minidao/pagehelper/dialect/PageAutoDialect.java)
+- **Stars**: 229
+- **Forks**: 175
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 95.0%
+- **根因分析**: 在多数据源场景下，`initDelegateDialect` 方法通过 `dialectThreadLocal.set()` 将数据库方言对象绑定到当前线程，但代码中从未调用 `dialectThreadLocal.remove()` 进行清理。当运行在线程池环境（如 Servlet 容器）时，线程会被复用，上一次请求残留的方言对象将持续存在于 `ThreadLocalMap` 中，可能导致后续请求使用错误的方言，或造成内存泄漏。
+
+**证据**:
+- 第88行: private ThreadLocal<AbstractHelperDialect> dialectThreadLocal = new ThreadLocal<AbstractHelperDialect>();
+- 第97行: dialectThreadLocal.set(getDialect(dataSource));
+- 全文件未出现: ThreadLocal.remove() 调用
+
+**修复建议**: 在每次请求或数据库操作完成后，必须调用 `dialectThreadLocal.remove()` 清除线程局部变量。建议：1) 提供 `clearDialect()` 方法调用 `dialectThreadLocal.remove()`；2) 在外部调用链（如 Filter 或 Interceptor 的 `afterCompletion`）中确保该方法被调用；3) 或者将 `dialectThreadLocal` 改为使用 `ThreadLocal.withInitial()` 并配合 try-finally 结构，在 finally 块中执行 remove。
+
+### 15. shiyindaxiaojie/eden-architect
+
+- **文件**: [eden-components/eden-spring-data/src/main/java/org/ylzl/eden/spring/data/hibernate/factory/HibernateSessionFactory.java](https://github.com/shiyindaxiaojie/eden-architect/blob/735d40cbe99424ceca9ec541a52144787dd9f314/eden-components/eden-spring-data/src/main/java/org/ylzl/eden/spring/data/hibernate/factory/HibernateSessionFactory.java)
+- **Stars**: 329
+- **Forks**: 83
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 90.0%
+- **根因分析**: 代码使用 ThreadLocal 缓存 Hibernate Session（第34行），在 getSession() 方法中调用 set() 将 Session 存入线程上下文（第73行）。虽然提供了 closeSession() 方法并通过 set(null) 进行清理（第83行），但该方法未在 finally 块中保证调用。当此工厂被用于线程池环境（如 Web 服务器线程池）且调用方未在 finally 中显式关闭时，Session 将残留在已归还的线程中，造成数据泄漏或内存泄漏。
+
+**证据**:
+- 第 34 行: private final ThreadLocal<Session> sessionThreadLocal = new ThreadLocal<Session>();
+- 第 73 行: this.sessionThreadLocal.set(session);
+- 第 83 行: this.sessionThreadLocal.set(null);  // 仅在 closeSession() 中调用，未强制于 finally 中执行
+
+**修复建议**: 避免让调用者手动管理 ThreadLocal 清理。应使用 try-finally 结构确保每次 getSession() 后均在 finally 块中调用 remove()；或在应用层使用 Filter/Interceptor 统一在请求结束时清理，例如添加一个 ThreadLocalHolder 并在 finally 中执行 remove()，避免依赖手动调用 closeSession()。
+
+### 16. RKQF-JVS/jvs
+
+- **文件**: [jvs/jvs-core-parent/jvs-starter-web/src/main/java/cn/bctools/web/config/ContextHolderFilter.java](https://github.com/RKQF-JVS/jvs/blob/1fbf9a58ff5733b4a3a9b15d52fddd8e0ce8b0be/jvs/jvs-core-parent/jvs-starter-web/src/main/java/cn/bctools/web/config/ContextHolderFilter.java)
+- **Stars**: 100
+- **Forks**: 42
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 95.0%
+- **根因分析**: 在 doFilter 方法中，对 SystemThreadLocal 执行了 set() 操作后，调用了 filterChain.doFilter()，随后才调用 SystemThreadLocal.clear()。但由于 clear() 没有被放置在 finally 块中，当 filterChain.doFilter() 抛出异常时，clear() 将不会被执行，导致 ThreadLocal 中残留的数据在线程池复用的线程中继续存在，造成后续请求的数据污染或内存泄漏。
+
+**证据**:
+- 第 38 行: SystemThreadLocal.set(SysConstant.VERSION, version);
+- 第 42 行: SystemThreadLocal.set(SysConstant.TENANTID, tenantId);
+- 第 44 行: filterChain.doFilter(request, response);
+- 第 45 行: SystemThreadLocal.clear();  // 未包裹在 finally 块中，存在异常路径泄漏
+
+**修复建议**: 将 filterChain.doFilter() 调用以及 clear() 操作放置在 try-finally 结构中，保证无论是否发生异常都能执行 clear()。例如：
+try {
+    filterChain.doFilter(request, response);
+} finally {
+    SystemThreadLocal.clear();
+}
+
+### 17. liferay/liferay-portal
+
+- **文件**: [modules/apps/commerce/commerce-service/src/main/java/com/liferay/commerce/internal/servlet/filter/CommerceContextFilter.java](https://github.com/liferay/liferay-portal/blob/1fd0da2854d579c26d2d118b63b6d03055cfaae0/modules/apps/commerce/commerce-service/src/main/java/com/liferay/commerce/internal/servlet/filter/CommerceContextFilter.java)
+- **Stars**: 2259
+- **Forks**: 3784
+- **误用类型**: THREADLOCAL_LEAK
+- **置信度**: 95.0%
+- **根因分析**: 在 processFilter 方法中调用了 CommerceGroupThreadLocal.set() 设置线程局部变量，但整个方法没有通过 try-finally 或在 doFilter 之后显式调用 remove() 进行清理。由于该 Filter 运行在 Servlet 容器（如 Tomcat）的线程池环境中，线程会被重复使用，未清理的 ThreadLocal 会导致下一个请求复用线程时读到上一个请求的数据，造成数据污染和内存泄漏。
+
+**证据**:
+- 第 62-70 行: try { ... CommerceGroupThreadLocal.set(_groupLocalService.fetchGroup(groupId)); } catch ...
+- 第 75 行: filterChain.doFilter(httpServletRequest, httpServletResponse);
+- 全文件中未出现 CommerceGroupThreadLocal.remove() 调用
+
+**修复建议**: 在 processFilter 方法中使用 try-finally 块，在 finally 中调用 CommerceGroupThreadLocal.remove()，确保请求处理结束后清理线程局部变量。例如：
+```
+CommerceGroupThreadLocal.set(...);
+try {
+    filterChain.doFilter(...);
+} finally {
+    CommerceGroupThreadLocal.remove();
+}
+```
+
+## 排除的误报
+
+- **hiero-ledger/hiero-consensus-node/platform-sdk/base-concurrent/src/timingSensitive/java/org/hiero/base/concurrent/internal/ThreadLocalHandlingTest.java**: NOT_MISUSE - 代码中的 ThreadLocal 实例仅在测试方法内创建，并通过线程工厂的启动回调（onStartup）在线程创建时设置一次固定值，之后不再更改。该值在线程生命周期内持续有效，且线程池线程在本测试结束后即被关闭，不存在跨请求/跨任务的数据泄漏风险。测试的设计目的正是验证线程工厂能正确初始化线程局部变量，因此刻意不移除 ThreadLocal 值，属于合理使用场景，不满足任何已知的 ThreadLocal 误用模式。
+
+- **JPressProjects/jpress/jpress-core/src/main/java/io/jpress/web/handler/JPressHandler.java**: HAS_CORRECT_CLEANUP - 该文件中的两个 ThreadLocal（targetContext 和 requestContext）在 handle() 方法内使用 try-finally 块保证了无论正常返回还是发生异常都会调用 remove() 清理数据，因此不存在线程复用时数据泄漏的风险。且 ThreadLocal 存储的是简单类型（String 和 HttpServletRequest），不存在循环引用或共享可变状态等问题。
+
+- **kanwangzjm/funiture/src/main/java/com/app/mvc/acl/util/RequestHolder.java**: NOT_MISUSE - 该类提供了两个静态 ThreadLocal 字段（userHolder 和 requestHolder）用于在当前请求线程中存储用户和请求对象。虽然 add 方法执行 set 后未在原地直接调用 remove，但类中已明确提供了公共的 remove 方法，表明设计意图是由外部调用者（如 Filter 或 Interceptor）在请求结束时进行清理。仅从该文件分析，未发现缺少清理机制的错误；泄漏风险取决于调用方是否正确地在 finally 块中调用 remove，而非本类本身的设计缺陷。
+
+- **h2oai/h2o-3/h2o-core/src/main/java/water/server/ServletUtils.java**: NOT_MISUSE - 代码中定义的 ThreadLocal 均为 static final 字段（第49-51行），ThreadLocal_Strong_Reference_Cycle 误用模式要求 ThreadLocal 为非 static final 的实例字段才可能通过值对象反向持有 ThreadLocal 实例形成强引用循环。此处不符合该模式的前置条件。
+
+- **PacktPublishing/Java-Coding-Problems-Second-Edition/Chapter11/P230_VirtualThreadAndThreadLocal/src/main/java/modern/challenge/Main.java**: HAS_CORRECT_CLEANUP - 代码在任务末尾显式调用了threadLocal.remove()，且捕获了InterruptedException后仍继续执行后续代码，所有执行路径（包括异常路径）都能到达remove()调用。同时，使用Executors.newVirtualThreadPerTaskExecutor()创建的虚拟线程每个任务独立，线程终止后ThreadLocal值自然无泄漏风险。因此，不存在ThreadLocal内存泄漏或数据污染。

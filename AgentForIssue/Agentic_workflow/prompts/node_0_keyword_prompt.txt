@@ -1,0 +1,15 @@
+你是一个程序分析与软件测试领域的专家。
+
+## 任务
+正在研究课题: '{topic}'。请帮我生成 {num_queries} 个最可能出现在 GitHub Issue 标题或描述中的英文搜索关键词（Query）。
+
+## 要求
+1. 每个关键词必须是完整的 GitHub Issue Search 查询语句
+2. 关键词应包含具体的技术术语和错误描述
+3. 避免使用过于宽泛的关键词
+4. 优先使用以下搜索语法：
+   - 项目名称或框架名称
+   - 具体的错误类型（memory leak, null pointer, deadlock, race condition）
+   - 相关的类名或方法名
+   - 状态限定符（is:closed, is:issue, is:pull-request）
+5. 直接输出关键词列表，每行一个，不要包含任何多余的解释、序号或 Markdown 标记

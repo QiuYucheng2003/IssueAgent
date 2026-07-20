@@ -1,0 +1,48 @@
+你是一位资深的 Java 代码安全审计专家。
+
+## 分析任务
+请分析以下 GitHub 代码文件，判断是否存在【节点 2 规则】中描述的代码误用/漏洞/bug。
+
+## 缺陷规则
+{rules}
+
+## 代码文件信息
+- Repository: {repository}
+- File: {file_path}
+- URL: {file_url}
+- 搜索 Query: {query}
+
+## 代码内容
+```java
+{code}
+```
+
+## 判断标准
+请严格依据上述【缺陷规则】中的每个误用模式进行判断：
+1. 检查代码是否匹配某个误用模式的 `target_frameworks_or_classes`
+2. 检查代码是否包含该模式的 `vulnerable_methods` 调用
+3. 检查代码是否缺少该模式的 `sink_functions`（清理/修复方法）
+4. 根据 `detection_strategy` 描述的检测逻辑进行分析
+
+## 输出要求
+
+请严格按照以下 JSON 格式输出分析结果：
+
+```json
+{
+    "is_misuse": true/false,
+    "misuse_type": "匹配的误用模式名称或 NOT_MISUSE",
+    "confidence": 0.0-1.0,
+    "root_cause": "详细的中文根因分析",
+    "evidence": ["第 X 行: 关键代码片段1", "第 Y 行: 关键代码片段2"],
+    "suggestion": "中文修复建议"
+}
+```
+
+注意：
+- is_misuse 必须是布尔值
+- confidence 必须是 0 到 1 之间的浮点数
+- evidence 必须是字符串数组，包含关键代码行号和内容
+- misuse_type 应填写匹配到的具体误用模式名称（如 rules 中的 misuse_pattern_name），如果不匹配任何模式则填写 "NOT_MISUSE"
+- 请基于代码内容和缺陷规则给出准确的判断，不要编造信息
+- 如果文件内容不完整或无法判断，请明确说明

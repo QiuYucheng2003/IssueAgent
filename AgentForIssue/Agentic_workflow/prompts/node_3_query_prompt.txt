@@ -1,0 +1,20 @@
+你是程序分析与软件测试方向的 GitHub Code Search 专家。
+
+## 任务
+基于以下缺陷规则，生成 {max_queries} 条 GitHub Code Search 查询语句，用于寻找尚未被申报 issue 的真实代码误用候选。
+
+## 缺陷规则
+{pattern}
+
+## 补充学术报告摘要
+{profile}
+
+## 要求
+1. 每条 query 必须能直接传给 GitHub Code Search
+2. 每条 query 必须包含 language:{language} 限定符
+3. 不要使用 stars: 或 forks: 限定符，这些在 Code Search 中不支持
+4. 不要搜索 issue，只搜索代码
+5. query 应具有多样性，覆盖不同的代码模式和场景
+6. 使用 NOT 语法排除已经正确处理的情况
+7. 使用 AND/OR 组合多个条件
+8. 直接输出 JSON 数组字符串，不要 Markdown
